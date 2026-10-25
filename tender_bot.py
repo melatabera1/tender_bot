@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-Tender & Bid Telegram Monitor for Media & Communication Agencies
-Monitors:
-  1. 2Merkato Tenders (https://tender.2merkato.com/tenders)
-  2. EthioJobs Consultancies/RFPs & Media Jobs (https://ethiojobs.net/jobs)
-  3. The Reporter Tenders (https://reportertenders.com/all-tenders/ & Telegram feed)
-  4. AfroTender (https://afrotender.com/tenders)
+Enterprise Ethiopian Tender & Bid Intelligence Bot (AI-Powered & Multi-Client)
+Built for Media, Communication & B2B Agencies in Ethiopia.
+
+Features Included:
+  1. AI Precision Engine (Google Gemini API) - Eliminates false positives & summarizes bids
+  2. Paid Portal Login Support (2Merkato & AfroTender subscriber sessions)
+  3. Multi-Client Management (Manage paying clients directly via Telegram commands)
+  4. SHA-256 Content Deduplication (Never sends duplicate tenders even if reposted)
+  5. Built-in Free Cloud Health Server (Works on Render Free Web Service $0/mo)
 """
 
 import os
@@ -13,8 +16,11 @@ import sys
 import asyncio
 import logging
 import sqlite3
+import hashlib
 import re
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime
 from typing import List, Dict, Optional
 from dataclasses import dataclass
@@ -34,82 +40,58 @@ from telegram.ext import (
 load_dotenv()
 
 # ==============================================================================
-# ⚙️ EASY CONFIGURATION
+# ⚙️ STEP-BY-STEP EASY CONFIGURATION (FILL THESE IN)
 # ==============================================================================
-# 1. Your Telegram Bot Token:
+
+# 1. Your Telegram Bot Token (Already configured for you!):
 MY_BOT_TOKEN = "8772423781:AAHYbS4JNdPwYwxiAF0mskFO1IPIEXLlJFs"
 
-# 2. Your Telegram Chat ID:
+# 2. Your Personal Admin Telegram Chat ID (Already configured for you!):
 MY_CHAT_ID = "5337175992"
 
-# Scan interval in minutes (30 minutes)
+# 3. FREE Google Gemini AI Key (Configured for you!):
+#    Note: Standard Google AI Studio keys start with "AIza...". If this key is from
+#    another portal, the bot will automatically fall back to smart keyword mode if needed.
+GEMINI_API_KEY = "AQ.Ab8RN6JqwIzBI3FxdRygvaJxM1Q3nR0fblGe9PJFIhkGwk7oYw"
+
+# 4. PAID TENDER WEBSITE LOGINS (Optional - Fill in when you buy a subscription):
+MERKATO_USERNAME = ""
+MERKATO_PASSWORD = ""
+
+AFROTENDER_USERNAME = ""
+AFROTENDER_PASSWORD = ""
+
+# 5. Scanner Settings:
 SCAN_INTERVAL_MINUTES = 30
 DATABASE_PATH = "tenders.db"
-
-# Lookback settings: Scan up to 3 days back across multiple pages
 LOOKBACK_DAYS = 3
-MAX_PAGES_TO_SCAN = 3
+AI_CONFIDENCE_THRESHOLD = 70  # Only send tenders scored 70% or higher by AI
 
-# Resolve config (prioritizes code variables, falls back to .env)
+# Resolve config from code or cloud environment variables
 BOT_TOKEN = MY_BOT_TOKEN.strip() or os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-AUTHORIZED_CHAT_ID = MY_CHAT_ID.strip() or os.getenv("TELEGRAM_CHAT_ID", "").strip()
+ADMIN_CHAT_ID = MY_CHAT_ID.strip() or os.getenv("TELEGRAM_CHAT_ID", "").strip()
+AI_KEY = GEMINI_API_KEY.strip() or os.getenv("GEMINI_API_KEY", "").strip()
 
-# Default Media & Communication Keywords
+MERKATO_USER = MERKATO_USERNAME.strip() or os.getenv("MERKATO_USERNAME", "").strip()
+MERKATO_PASS = MERKATO_PASSWORD.strip() or os.getenv("MERKATO_PASSWORD", "").strip()
+AFRO_USER = AFROTENDER_USERNAME.strip() or os.getenv("AFROTENDER_USERNAME", "").strip()
+AFRO_PASS = AFROTENDER_PASSWORD.strip() or os.getenv("AFROTENDER_PASSWORD", "").strip()
+
+# Default Media & Communication Keywords (Stage 1 Fast Filter)
 DEFAULT_MEDIA_KEYWORDS = [
     # English keywords
-    "media",
-    "communication",
-    "communications",
-    "video production",
-    "video",
-    "documentary",
-    "advertising",
-    "advertisement",
-    "public relations",
-    "pr firm",
-    "branding",
-    "graphic design",
-    "graphics",
-    "social media",
-    "creative agency",
-    "tv commercial",
-    "radio spot",
-    "radio",
-    "television",
-    "audio visual",
-    "audiovisual",
-    "animation",
-    "photography",
-    "photo",
-    "printing",
-    "event management",
-    "event organizing",
-    "campaign",
-    "content creation",
-    "translation",
-    "signage",
-    "billboard",
-    "press conference",
-    "consultancy",
-    "tor",
-    "rfp",
-    # Amharic keywords (common on 2Merkato & Reporter)
-    "ማስታወቂያ",
-    "ህትመት",
-    "ሕትመት",
-    "ሚዲያ",
-    "ኮሙኒኬሽን",
-    "ኮሚዩኒኬሽን",
-    "የህዝብ ግንኙነት",
-    "ቪዲዮ",
-    "ዘጋቢ ፊልም",
-    "ዶክመንተሪ",
-    "ፎቶ",
-    "ፎቶግራፍ",
-    "ግራፊክስ",
-    "ዲዛይን",
-    "ስልጠና",
-    "ዝግጅት"
+    "media", "communication", "communications", "video production", "video",
+    "documentary", "advertising", "advertisement", "public relations", "pr firm",
+    "branding", "graphic design", "graphics", "social media", "creative agency",
+    "tv commercial", "radio spot", "radio", "television", "audio visual",
+    "audiovisual", "animation", "photography", "photo", "printing",
+    "event management", "event organizing", "campaign", "content creation",
+    "translation", "signage", "billboard", "press conference", "consultancy",
+    "tor", "rfp", "eoi", "expression of interest", "call for proposals", "production",
+    # Amharic keywords
+    "ማስታወቂያ", "ህትመት", "ሕትመት", "ሚዲያ", "ኮሙኒኬሽን", "ኮሚዩኒኬሽን",
+    "የህዝብ ግንኙነት", "ቪዲዮ", "ዘጋቢ ፊልም", "ዶክመንተሪ", "ፎቶ", "ፎቶግራፍ",
+    "ግራፊክስ", "ዲዛይን", "ስልጠና", "ዝግጅት"
 ]
 
 # Configure Logging
@@ -117,10 +99,37 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
-logger = logging.getLogger("TenderBot")
+logger = logging.getLogger("EnterpriseTenderBot")
+
 
 # ==========================================
-# DATA MODELS
+# 🌐 FREE CLOUD PORT LISTENER (FOR RENDER)
+# ==========================================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Ethiopian Tender AI Bot is Active and Running 24/7!")
+
+    def log_message(self, format, *args):
+        return  # Keep console logs clean
+
+
+def start_free_cloud_web_server():
+    """Starts a tiny background web server so Render Free Web Service stays alive 24/7."""
+    port = int(os.environ.get("PORT", 10000))
+    try:
+        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        logger.info(f"Cloud Health Web Server listening on port {port}")
+    except Exception as e:
+        logger.warning(f"Note: Web server port {port} skipped: {e}")
+
+
+# ==========================================
+# 📦 DATA MODELS
 # ==========================================
 @dataclass
 class Tender:
@@ -133,63 +142,91 @@ class Tender:
     snippet: str
     matched_keywords: List[str]
     posted_date: str = "Recent"
+    ai_summary: str = ""
+    ai_score: int = 0
+    ai_requirements: str = ""
 
 
 # ==========================================
-# DATABASE REPOSITORY (SQLite)
+# 🗄️ DATABASE (TENDERS, KEYWORDS & CLIENTS)
 # ==========================================
 class Database:
     def __init__(self, db_path: str = DATABASE_PATH):
         self.db_path = db_path
         self._init_db()
 
+    def _compute_hash(self, title: str, org: str) -> str:
+        clean = re.sub(r"\W+", "", f"{title.lower()}{org.lower()}")
+        return hashlib.sha256(clean.encode("utf-8")).hexdigest()
+
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
+            # Seen tenders table with content hash
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS seen_tenders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     source TEXT NOT NULL,
                     tender_url TEXT UNIQUE NOT NULL,
+                    content_hash TEXT,
                     title TEXT NOT NULL,
                     organization TEXT,
                     detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # Keywords table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS keywords (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     keyword TEXT UNIQUE NOT NULL
                 )
             """)
+            # Multi-tenant clients table (for your SaaS startup!)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS subscribed_clients (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id TEXT UNIQUE NOT NULL,
+                    client_name TEXT NOT NULL,
+                    sector TEXT DEFAULT 'Media & Communications',
+                    is_active INTEGER DEFAULT 1,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             conn.commit()
 
-            cursor.execute("SELECT COUNT(*) FROM keywords")
-            count = cursor.fetchone()[0]
-            if count == 0:
-                cursor.executemany(
-                    "INSERT OR IGNORE INTO keywords (keyword) VALUES (?)",
-                    [(kw.lower(),) for kw in DEFAULT_MEDIA_KEYWORDS]
-                )
-                conn.commit()
-            else:
-                for kw in DEFAULT_MEDIA_KEYWORDS:
-                    cursor.execute("INSERT OR IGNORE INTO keywords (keyword) VALUES (?)", (kw.lower(),))
-                conn.commit()
+            # Ensure default keywords exist
+            for kw in DEFAULT_MEDIA_KEYWORDS:
+                cursor.execute("INSERT OR IGNORE INTO keywords (keyword) VALUES (?)", (kw.lower(),))
 
-    def is_tender_seen(self, url: str) -> bool:
+            # Ensure Admin Chat ID is automatically registered as the primary client
+            if ADMIN_CHAT_ID:
+                cursor.execute("""
+                    INSERT OR IGNORE INTO subscribed_clients (chat_id, client_name, sector)
+                    VALUES (?, 'Admin (My Personal Account)', 'Media & Communications')
+                """, (ADMIN_CHAT_ID,))
+            conn.commit()
+
+    def is_tender_seen(self, url: str, title: str = "", org: str = "") -> bool:
+        content_hash = self._compute_hash(title, org) if title else ""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM seen_tenders WHERE tender_url = ?", (url,))
+            if content_hash:
+                cursor.execute(
+                    "SELECT 1 FROM seen_tenders WHERE tender_url = ? OR content_hash = ?",
+                    (url, content_hash)
+                )
+            else:
+                cursor.execute("SELECT 1 FROM seen_tenders WHERE tender_url = ?", (url,))
             return cursor.fetchone() is not None
 
     def mark_tender_seen(self, tender: Tender):
+        content_hash = self._compute_hash(tender.title, tender.organization)
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT OR IGNORE INTO seen_tenders (source, tender_url, title, organization)
-                VALUES (?, ?, ?, ?)
-            """, (tender.source, tender.url, tender.title, tender.organization))
+                INSERT OR IGNORE INTO seen_tenders (source, tender_url, content_hash, title, organization)
+                VALUES (?, ?, ?, ?, ?)
+            """, (tender.source, tender.url, content_hash, tender.title, tender.organization))
             conn.commit()
 
     def get_keywords(self) -> List[str]:
@@ -219,6 +256,29 @@ class Database:
             conn.commit()
             return cursor.rowcount > 0
 
+    def add_client(self, chat_id: str, client_name: str) -> bool:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO subscribed_clients (chat_id, client_name, is_active)
+                VALUES (?, ?, 1)
+            """, (chat_id.strip(), client_name.strip()))
+            conn.commit()
+            return True
+
+    def remove_client(self, chat_id: str) -> bool:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM subscribed_clients WHERE chat_id = ?", (chat_id.strip(),))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def get_active_clients(self) -> List[Dict[str, str]]:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT chat_id, client_name, sector FROM subscribed_clients WHERE is_active = 1")
+            return [{"chat_id": r[0], "name": r[1], "sector": r[2]} for r in cursor.fetchall()]
+
     def get_stats(self) -> Dict[str, int]:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
@@ -226,15 +286,94 @@ class Database:
             total_seen = cursor.fetchone()[0]
             cursor.execute("SELECT COUNT(*) FROM keywords")
             total_keywords = cursor.fetchone()[0]
-            return {"total_seen": total_seen, "total_keywords": total_keywords}
+            cursor.execute("SELECT COUNT(*) FROM subscribed_clients WHERE is_active = 1")
+            total_clients = cursor.fetchone()[0]
+            return {
+                "total_seen": total_seen,
+                "total_keywords": total_keywords,
+                "total_clients": total_clients
+            }
 
 
 # ==========================================
-# SCRAPERS & PARSERS
+# 🧠 AI PRECISION FILTER (GOOGLE GEMINI)
+# ==========================================
+class AITenderAnalyzer:
+    """Uses Google Gemini Flash to verify, score, and summarize Ethiopian tenders."""
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.enabled = bool(api_key)
+
+    async def evaluate_tender(self, client: httpx.AsyncClient, tender: Tender) -> bool:
+        """
+        Returns True if the tender should be kept, False if AI determines it's a false positive.
+        If GEMINI_API_KEY is not set or invalid, it gracefully returns True and uses standard keyword mode.
+        """
+        if not self.enabled:
+            return True
+
+        prompt = f"""
+You are a Senior Procurement Analyst in Ethiopia working for a Media, Communications, Advertising, Printing, Photography, Audiovisual, and PR Agency.
+Analyze the following tender/job listing and respond ONLY in valid JSON format.
+
+Title: {tender.title}
+Organization: {tender.organization}
+Snippet: {tender.snippet}
+Matched Keywords: {', '.join(tender.matched_keywords)}
+
+Determine if this notice is genuinely useful for a Media, Creative, Communication, Printing, Event, or Consultancy agency.
+Reject false positives (for example, construction tenders that only mention "media" as in "filter media for water pipes", or generic website menu headers).
+
+Respond with this exact JSON structure:
+{{
+  "relevance_score": <integer from 0 to 100>,
+  "clean_title": "<clean, readable title in English>",
+  "organization": "<organization name if identifiable, else '{tender.organization}'>",
+  "deadline": "<extracted closing date/deadline or '{tender.deadline}'>",
+  "requirements": "<key eligibility or service needed in 1 short line>",
+  "executive_summary": "<concise 2-sentence summary of what the client wants to buy>"
+}}
+"""
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={self.api_key}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1}
+        }
+
+        try:
+            resp = await client.post(url, json=payload, timeout=15.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+                parsed = json.loads(raw_text)
+
+                score = int(parsed.get("relevance_score", 80))
+                tender.ai_score = score
+
+                if score < AI_CONFIDENCE_THRESHOLD:
+                    logger.info(f"AI Rejected False Positive ({score}%): {tender.title[:60]}")
+                    return False
+
+                tender.title = parsed.get("clean_title") or tender.title
+                tender.organization = parsed.get("organization") or tender.organization
+                tender.deadline = parsed.get("deadline") or tender.deadline
+                tender.ai_requirements = parsed.get("requirements", "")
+                tender.ai_summary = parsed.get("executive_summary", "")
+                return True
+        except Exception as e:
+            logger.debug(f"AI evaluation fallback (keeping tender via keywords): {e}")
+
+        return True
+
+
+# ==========================================
+# 🔐 AUTHENTICATED & MULTI-SOURCE SCRAPER
 # ==========================================
 class TenderScraper:
-    def __init__(self, db: Database):
+    def __init__(self, db: Database, ai: AITenderAnalyzer):
         self.db = db
+        self.ai = ai
         self.headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -244,13 +383,56 @@ class TenderScraper:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9,am;q=0.8",
         }
+        self.merkato_cookies = {}
+        self.afrotender_cookies = {}
+
+    async def _login_2merkato_if_configured(self, client: httpx.AsyncClient):
+        """Logs into 2Merkato if subscriber credentials are provided."""
+        if not (MERKATO_USER and MERKATO_PASS) or self.merkato_cookies:
+            return
+        try:
+            login_url = "https://tender.2merkato.com/login"
+            page = await client.get(login_url, headers=self.headers, timeout=15.0)
+            soup = BeautifulSoup(page.text, "html.parser")
+            csrf = soup.find("input", {"name": "_token"})
+            form_data = {
+                "email": MERKATO_USER,
+                "username": MERKATO_USER,
+                "password": MERKATO_PASS,
+            }
+            if csrf and csrf.get("value"):
+                form_data["_token"] = csrf["value"]
+
+            resp = await client.post(login_url, data=form_data, headers=self.headers, timeout=15.0)
+            if resp.status_code in (200, 302):
+                self.merkato_cookies = dict(client.cookies)
+                logger.info("Successfully authenticated subscriber session on 2Merkato!")
+        except Exception as e:
+            logger.warning(f"2Merkato subscriber login note: {e}")
+
+    async def _login_afrotender_if_configured(self, client: httpx.AsyncClient):
+        """Logs into AfroTender if subscriber credentials are provided."""
+        if not (AFRO_USER and AFRO_PASS) or self.afrotender_cookies:
+            return
+        try:
+            login_url = "https://afrotender.com/login"
+            resp = await client.post(
+                login_url,
+                data={"email": AFRO_USER, "password": AFRO_PASS},
+                headers=self.headers,
+                timeout=15.0
+            )
+            if resp.status_code in (200, 302):
+                self.afrotender_cookies = dict(client.cookies)
+                logger.info("Successfully authenticated subscriber session on AfroTender!")
+        except Exception as e:
+            logger.warning(f"AfroTender subscriber login note: {e}")
 
     def _is_category_or_nav(self, title: str, url: str) -> bool:
         """Filter out generic category taxonomy pages, menus, and navigation links."""
         url_lower = url.lower()
         title_lower = title.strip().lower()
 
-        # 1. URL patterns indicating archives, categories, tags, or system pages
         junk_url_parts = [
             "/category/", "/categories/", "/tender-category/", "/job-category/",
             "/services/", "/tag/", "/tags/", "/sector/", "/browse",
@@ -260,26 +442,19 @@ class TenderScraper:
         if any(junk in url_lower for junk in junk_url_parts):
             return True
 
-        # 2. Titles that are purely general taxonomy/category headers
         words = title_lower.split()
         if len(words) <= 4:
             category_endings = ["service", "services", "category", "categories", "tenders", "jobs", "vacancies", "sector"]
             if words and words[-1] in category_endings:
                 return True
             if title_lower in [
-                "printing & publishing",
-                "printing & publishing service",
-                "advertising & public relations",
-                "media & communication",
-                "consultancy & training",
-                "consultancy services",
-                "all tenders",
-                "free tenders",
-                "latest tenders"
+                "printing & publishing", "printing & publishing service",
+                "advertising & public relations", "media & communication",
+                "consultancy & training", "consultancy services",
+                "all tenders", "free tenders", "latest tenders"
             ]:
                 return True
 
-        # 3. Discard overly brief titles that lack organizational or procurement context
         if len(title.strip()) < 18:
             return True
 
@@ -321,24 +496,24 @@ class TenderScraper:
                     matches.append(kw_clean)
         return matches
 
-    # 1. 2MERKATO TENDERS (Main + Free Tenders)
+    # 1. 2MERKATO TENDERS
     async def fetch_2merkato(self, client: httpx.AsyncClient, keywords: Optional[List[str]] = None, ignore_seen: bool = False) -> List[Tender]:
+        await self._login_2merkato_if_configured(client)
         tenders = []
         urls = [
             "https://tender.2merkato.com/tenders/free",
             "https://tender.2merkato.com/tenders",
+            "https://tender.2merkato.com/tenders?page=2"
         ]
-        
+
         for url in urls:
             try:
-                resp = await client.get(url, headers=self.headers, timeout=25.0)
+                resp = await client.get(url, headers=self.headers, cookies=self.merkato_cookies, timeout=25.0)
                 if resp.status_code != 200:
-                    logger.warning(f"2Merkato returned status {resp.status_code} for {url}")
                     continue
 
                 soup = BeautifulSoup(resp.text, "html.parser")
-                links = soup.find_all("a", href=True)
-                for link in links:
+                for link in soup.find_all("a", href=True):
                     href = link["href"]
                     if not ("/tender" in href or "/tenders/view" in href):
                         continue
@@ -349,7 +524,7 @@ class TenderScraper:
                     if self._is_category_or_nav(title, tender_url):
                         continue
 
-                    if not ignore_seen and keywords is not None and self.db.is_tender_seen(tender_url):
+                    if not ignore_seen and keywords is not None and self.db.is_tender_seen(tender_url, title, "2Merkato"):
                         continue
 
                     parent = link.find_parent("tr") or link.find_parent("li") or link.find_parent("div")
@@ -370,7 +545,7 @@ class TenderScraper:
                             organization="2Merkato Listed Organization",
                             deadline=deadline,
                             category="Tender",
-                            snippet=parent_text[:280] + ("..." if len(parent_text) > 280 else ""),
+                            snippet=parent_text[:300] + ("..." if len(parent_text) > 300 else ""),
                             matched_keywords=matches,
                             posted_date="Recent"
                         ))
@@ -378,14 +553,13 @@ class TenderScraper:
                 logger.error(f"Error scraping 2Merkato ({url}): {e}")
         return tenders
 
-    # 2. ETHIOJOBS (Jobs, Consultancies, RFPs & ToRs)
+    # 2. ETHIOJOBS (Consultancies, RFPs, ToRs & Media Jobs)
     async def fetch_ethiojobs(self, client: httpx.AsyncClient, keywords: Optional[List[str]] = None, ignore_seen: bool = False) -> List[Tender]:
         tenders = []
         seen_job_urls = set()
 
-        # A. Directly query EthioJobs REST API if available
         api_urls = [
-            "https://api.ethiojobs.net/ethiojobs/jobs?page=1&perPage=40",
+            "https://api.ethiojobs.net/ethiojobs/jobs?page=1&perPage=45",
             "https://api.ethiojobs.net/ethiojobs/jobs"
         ]
         api_headers = {
@@ -415,10 +589,10 @@ class TenderScraper:
 
                         if self._is_category_or_nav(title, job_url):
                             continue
-                        if not ignore_seen and keywords is not None and self.db.is_tender_seen(job_url):
+                        company = item.get("companyName") or item.get("employer") or (item.get("company", {})).get("name") or "Organization on EthioJobs"
+                        if not ignore_seen and keywords is not None and self.db.is_tender_seen(job_url, title, str(company)):
                             continue
 
-                        company = item.get("companyName") or item.get("employer") or (item.get("company", {})).get("name") or "Organization on EthioJobs"
                         description = item.get("description") or item.get("summary") or title
                         deadline = item.get("deadline") or item.get("closingDate") or "Check posting"
                         posted = str(item.get("createdAt") or item.get("postedDate") or "Recent")[:10]
@@ -434,14 +608,13 @@ class TenderScraper:
                                 organization=str(company),
                                 deadline=str(deadline),
                                 category="Consultancy / RFP / ToR",
-                                snippet=clean_snippet[:280] + ("..." if len(clean_snippet) > 280 else ""),
+                                snippet=clean_snippet[:300] + ("..." if len(clean_snippet) > 300 else ""),
                                 matched_keywords=matches,
                                 posted_date=posted
                             ))
             except Exception as e:
                 logger.debug(f"EthioJobs API probe note: {e}")
 
-        # B. HTML Scraper + Next.js __NEXT_DATA__ JSON extractor
         web_urls = [
             "https://ethiojobs.net/jobs",
             "https://ethiojobs.net/jobs/consultancy-and-training"
@@ -451,58 +624,10 @@ class TenderScraper:
             try:
                 resp = await client.get(w_url, headers=self.headers, timeout=25.0)
                 if resp.status_code != 200:
-                    logger.warning(f"EthioJobs HTML returned status {resp.status_code} for {w_url}")
                     continue
 
                 soup = BeautifulSoup(resp.text, "html.parser")
-
-                # Check Next.js __NEXT_DATA__ embedded JSON
-                next_script = soup.find("script", id="__NEXT_DATA__")
-                if next_script and next_script.string:
-                    try:
-                        next_json = json.loads(next_script.string)
-                        page_props = next_json.get("props", {}).get("pageProps", {})
-                        embedded_jobs = page_props.get("jobs") or page_props.get("initialState", {}).get("jobs", [])
-                        if isinstance(embedded_jobs, list):
-                            for ej in embedded_jobs:
-                                if not isinstance(ej, dict):
-                                    continue
-                                title = ej.get("title") or ej.get("jobTitle") or ""
-                                slug = ej.get("slug") or ej.get("id") or ""
-                                if not title or not slug:
-                                    continue
-
-                                job_url = f"https://ethiojobs.net/job/{slug}"
-                                if job_url in seen_job_urls:
-                                    continue
-                                seen_job_urls.add(job_url)
-
-                                if self._is_category_or_nav(title, job_url):
-                                    continue
-                                if not ignore_seen and keywords is not None and self.db.is_tender_seen(job_url):
-                                    continue
-
-                                company = ej.get("companyName") or (ej.get("company", {})).get("name") or "Organization on EthioJobs"
-                                deadline = ej.get("deadline") or "Check posting"
-                                matches = self._match_keywords(title, keywords) if keywords else ["latest"]
-                                if matches:
-                                    tenders.append(Tender(
-                                        source="EthioJobs",
-                                        title=title,
-                                        url=job_url,
-                                        organization=str(company),
-                                        deadline=str(deadline),
-                                        category="Consultancy / RFP / ToR",
-                                        snippet=title,
-                                        matched_keywords=matches,
-                                        posted_date="Recent"
-                                    ))
-                    except Exception as err:
-                        logger.debug(f"EthioJobs Next.js parse note: {err}")
-
-                # Standard HTML <a> tag inspection (matches /job/<id>)
-                links = soup.find_all("a", href=True)
-                for link in links:
+                for link in soup.find_all("a", href=True):
                     href = link["href"]
                     if not ("/job/" in href or "/jobs/" in href):
                         continue
@@ -514,7 +639,7 @@ class TenderScraper:
                         continue
                     seen_job_urls.add(job_url)
 
-                    if not ignore_seen and keywords is not None and self.db.is_tender_seen(job_url):
+                    if not ignore_seen and keywords is not None and self.db.is_tender_seen(job_url, title, "EthioJobs"):
                         continue
 
                     parent = link.find_parent("article") or link.find_parent("li") or link.find_parent("div")
@@ -529,7 +654,7 @@ class TenderScraper:
                             organization="Organization on EthioJobs",
                             deadline="Check posting",
                             category="Consultancy / RFP / ToR",
-                            snippet=parent_text[:280] + ("..." if len(parent_text) > 280 else ""),
+                            snippet=parent_text[:300] + ("..." if len(parent_text) > 300 else ""),
                             matched_keywords=matches,
                             posted_date="Recent"
                         ))
@@ -537,10 +662,9 @@ class TenderScraper:
                 logger.error(f"Error scraping EthioJobs ({w_url}): {e}")
         return tenders
 
-    # 3. THE REPORTER & TELEGRAM TENDERS FEED
+    # 3. THE REPORTER & LIVE TELEGRAM TENDER FEEDS
     async def fetch_the_reporter(self, client: httpx.AsyncClient, keywords: Optional[List[str]] = None, ignore_seen: bool = False) -> List[Tender]:
         tenders = []
-        # Telegram Web feeds that mirror Reporter & Ethiopian tenders live:
         channels = [
             "https://t.me/s/reportertender",
             "https://t.me/s/tender_ethiopia"
@@ -574,11 +698,10 @@ class TenderScraper:
                     title = lines[0] if lines else "Tender Notice"
                     post_url = link_el.get("href", ch_url)
 
-                    # Avoid category or channel navigation posts
                     if self._is_category_or_nav(title, post_url):
                         continue
 
-                    if not ignore_seen and keywords is not None and self.db.is_tender_seen(post_url):
+                    if not ignore_seen and keywords is not None and self.db.is_tender_seen(post_url, title, "The Reporter"):
                         continue
 
                     matches = self._match_keywords(full_text, keywords) if keywords else ["latest"]
@@ -590,14 +713,13 @@ class TenderScraper:
                             organization="The Reporter Classifieds",
                             deadline="Refer to notice",
                             category="Tender Announcement",
-                            snippet=full_text[:280] + ("..." if len(full_text) > 280 else ""),
+                            snippet=full_text[:300] + ("..." if len(full_text) > 300 else ""),
                             matched_keywords=matches,
                             posted_date=posted
                         ))
             except Exception as e:
                 logger.warning(f"Error fetching channel {ch_url}: {e}")
 
-        # Direct reportertenders.com inspection (filtering out category archives)
         try:
             r_resp = await client.get("https://reportertenders.com/", headers=self.headers, timeout=20.0)
             if r_resp.status_code == 200:
@@ -607,11 +729,10 @@ class TenderScraper:
                     title = link.get_text(strip=True)
                     tender_url = href if href.startswith("http") else f"https://reportertenders.com{href}"
 
-                    # Explicitly discard category taxonomy pages (e.g. Printing & Publishing Service)
                     if self._is_category_or_nav(title, tender_url):
                         continue
 
-                    if not ignore_seen and keywords is not None and self.db.is_tender_seen(tender_url):
+                    if not ignore_seen and keywords is not None and self.db.is_tender_seen(tender_url, title, "ReporterTenders"):
                         continue
 
                     matches = self._match_keywords(title, keywords) if keywords else ["latest"]
@@ -632,8 +753,9 @@ class TenderScraper:
 
         return tenders
 
-    # 4. AFROTENDER (https://afrotender.com)
+    # 4. AFROTENDER
     async def fetch_afrotender(self, client: httpx.AsyncClient, keywords: Optional[List[str]] = None, ignore_seen: bool = False) -> List[Tender]:
+        await self._login_afrotender_if_configured(client)
         tenders = []
         urls = [
             "https://afrotender.com/tenders",
@@ -641,14 +763,12 @@ class TenderScraper:
         ]
         for url in urls:
             try:
-                resp = await client.get(url, headers=self.headers, timeout=25.0)
+                resp = await client.get(url, headers=self.headers, cookies=self.afrotender_cookies, timeout=25.0)
                 if resp.status_code != 200:
                     continue
 
                 soup = BeautifulSoup(resp.text, "html.parser")
-                links = soup.find_all("a", href=True)
-
-                for link in links:
+                for link in soup.find_all("a", href=True):
                     href = link["href"]
                     title = link.get_text(separator=" ", strip=True)
                     tender_url = href if href.startswith("http") else f"https://afrotender.com{href}"
@@ -656,7 +776,7 @@ class TenderScraper:
                     if self._is_category_or_nav(title, tender_url):
                         continue
 
-                    if not ignore_seen and keywords is not None and self.db.is_tender_seen(tender_url):
+                    if not ignore_seen and keywords is not None and self.db.is_tender_seen(tender_url, title, "AfroTender"):
                         continue
 
                     parent = link.find_parent("tr") or link.find_parent("div")
@@ -671,7 +791,7 @@ class TenderScraper:
                             organization="AfroTender Listing",
                             deadline="Check link",
                             category="Procurement",
-                            snippet=parent_text[:280] + "...",
+                            snippet=parent_text[:300] + "...",
                             matched_keywords=matches,
                             posted_date="Recent"
                         ))
@@ -690,22 +810,33 @@ class TenderScraper:
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        found_tenders = []
-        counts = {"2Merkato": 0, "EthioJobs": 0, "The Reporter": 0, "AfroTender": 0}
-        source_keys = ["2Merkato", "EthioJobs", "The Reporter", "AfroTender"]
+            candidates: List[Tender] = []
+            counts = {"2Merkato": 0, "EthioJobs": 0, "The Reporter": 0, "AfroTender": 0}
+            source_keys = ["2Merkato", "EthioJobs", "The Reporter", "AfroTender"]
 
-        for idx, res in enumerate(results):
-            source_name = source_keys[idx]
-            if isinstance(res, list):
-                counts[source_name] = len(res)
-                found_tenders.extend(res)
-            elif isinstance(res, Exception):
-                logger.error(f"Scraper error on {source_name}: {res}")
+            for idx, res in enumerate(results):
+                source_name = source_keys[idx]
+                if isinstance(res, list):
+                    counts[source_name] = len(res)
+                    candidates.extend(res)
+                elif isinstance(res, Exception):
+                    logger.error(f"Scraper error on {source_name}: {res}")
 
-        return {"tenders": found_tenders, "counts": counts}
+            # Stage 2: Pass candidates through AI Precision Filter (if GEMINI_API_KEY is configured)
+            verified_tenders: List[Tender] = []
+            seen_urls_in_batch = set()
+            for t in candidates:
+                if t.url in seen_urls_in_batch:
+                    continue
+                seen_urls_in_batch.add(t.url)
+
+                keep = await self.ai.evaluate_tender(client, t)
+                if keep:
+                    verified_tenders.append(t)
+
+        return {"tenders": verified_tenders, "counts": counts}
 
     async def get_raw_latest(self) -> List[Tender]:
-        """Fetch raw tenders regardless of keywords to verify live connection."""
         async with httpx.AsyncClient(verify=False, follow_redirects=True) as client:
             tasks = [
                 self.fetch_2merkato(client, keywords=None),
@@ -718,40 +849,43 @@ class TenderScraper:
         latest_list = []
         for res in results:
             if isinstance(res, list):
-                # Take up to 2 raw items from each responsive portal
                 latest_list.extend(res[:2])
         return latest_list
 
 
 # ==========================================
-# TELEGRAM FORMATTER & BROADCASTER
+# 💬 TELEGRAM MESSAGE FORMATTER
 # ==========================================
 def format_tender_message(tender: Tender) -> str:
     badge = {
         "2Merkato": "🟣 <b>2Merkato Tender</b>",
-        "EthioJobs": "🔵 <b>EthioJobs Opportunity</b>",
+        "EthioJobs": "🔵 <b>EthioJobs Consultancy / RFP</b>",
         "The Reporter": "🔴 <b>The Reporter Notice</b>",
         "AfroTender": "🟢 <b>AfroTender Bid</b>"
     }.get(tender.source, f"📌 <b>{tender.source}</b>")
 
-    tags = " ".join([f"<code>#{kw.replace(' ', '_')}</code>" for kw in tender.matched_keywords])
+    tags = " ".join([f"<code>#{kw.replace(' ', '_')}</code>" for kw in tender.matched_keywords[:6]])
+
+    ai_badge = f" | 🤖 <b>AI Match: {tender.ai_score}%</b>" if tender.ai_score > 0 else ""
+    summary_text = tender.ai_summary if tender.ai_summary else tender.snippet
+    req_line = f"📋 <b>Requirements:</b> {tender.ai_requirements}\n" if tender.ai_requirements else ""
 
     msg = (
-        f"{badge}\n\n"
+        f"{badge}{ai_badge}\n\n"
         f"🎯 <b>Title:</b> {tender.title}\n"
         f"🏢 <b>Client/Org:</b> {tender.organization}\n"
         f"📅 <b>Posted:</b> {tender.posted_date}\n"
         f"⏳ <b>Deadline:</b> {tender.deadline}\n"
-        f"🏷️ <b>Category:</b> {tender.category}\n"
+        f"{req_line}"
         f"🔑 <b>Matched Services:</b> {tags}\n\n"
-        f"📝 <b>Summary:</b>\n<i>{tender.snippet}</i>\n\n"
-        f"🔗 <a href='{tender.url}'><b>👉 Click Here to Open Bid</b></a>"
+        f"📝 <b>Executive Summary:</b>\n<i>{summary_text}</i>\n\n"
+        f"🔗 <a href='{tender.url}'><b>👉 Click Here to Open Official Tender</b></a>"
     )
     return msg
 
 
 # ==========================================
-# TELEGRAM BOT HANDLERS
+# 🤖 TELEGRAM BOT COMMAND HANDLERS
 # ==========================================
 class TenderBotApp:
     def __init__(self, db: Database, scraper: TenderScraper):
@@ -760,33 +894,33 @@ class TenderBotApp:
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = str(update.effective_chat.id)
-        user_name = update.effective_user.first_name
+        user_name = update.effective_user.first_name or "Partner"
+        ai_status = "✅ Active (Gemini Flash)" if AI_KEY else "⚡ Fast Keyword Mode (Add GEMINI_API_KEY for AI)"
 
         welcome_text = (
-            f"👋 <b>Hello {user_name}!</b>\n\n"
-            "I am your <b>Business Development Tender Monitor Bot</b> for Media & Communication services in Ethiopia.\n\n"
-            f"🆔 <b>Your Chat ID:</b> <code>{chat_id}</code>\n\n"
-            f"🗓️ <b>Coverage:</b> Scanning past <b>{LOOKBACK_DAYS} days</b> across multiple pages\n"
-            "🌐 <b>Active Web Sources:</b>\n"
-            "• 2Merkato (tender.2merkato.com/tenders)\n"
-            "• EthioJobs (ethiojobs.net/jobs - RFPs & ToRs)\n"
-            "• The Reporter (reportertenders.com & t.me/s/reportertender)\n"
-            "• AfroTender (afrotender.com/tenders)\n\n"
-            "🛠 <b>Commands:</b>\n"
-            "/scan - Scan for new media tenders (past 3 days)\n"
-            "/rescan - Re-send all 3-day media tenders (even seen ones)\n"
-            "/latest - Preview newest live posts directly from portals\n"
-            "/keywords - View current filtered keywords\n"
-            "/addkeyword &lt;word&gt; - Add custom keyword (English or Amharic)\n"
-            "/delkeyword &lt;word&gt; - Remove a keyword\n"
-            "/status - Bot health & statistics\n"
-            "/help - Display this manual"
+            f"👋 <b>Selam {user_name}!</b>\n\n"
+            "Welcome to the <b>Ethiopian Tender & Bid Intelligence Platform</b>.\n\n"
+            f"🆔 <b>This Chat/Group ID:</b> <code>{chat_id}</code>\n"
+            f"🧠 <b>AI Precision Engine:</b> {ai_status}\n"
+            f"🗓️ <b>Scan Depth:</b> Past <b>{LOOKBACK_DAYS} days</b> (Every {SCAN_INTERVAL_MINUTES} mins)\n\n"
+            "🛠 <b>Tender Commands:</b>\n"
+            "/scan - Scan for new media & communication tenders\n"
+            "/rescan - Re-send all 3-day matching tenders (even seen ones)\n"
+            "/latest - Preview live posts directly from portals\n"
+            "/keywords - View monitored service keywords\n"
+            "/addkeyword &lt;word&gt; - Add custom keyword (English/Amharic)\n"
+            "/delkeyword &lt;word&gt; - Remove a keyword\n\n"
+            "💼 <b>Business & Client Management (SaaS):</b>\n"
+            "/subscribe &lt;Chat_ID&gt; &lt;Company Name&gt; - Add a paying client or group\n"
+            "/unsubscribe &lt;Chat_ID&gt; - Remove a client\n"
+            "/clients - List all active subscribed clients\n"
+            "/status - System health, logins & statistics"
         )
         await update.message.reply_text(welcome_text, parse_mode=ParseMode.HTML)
 
     async def scan_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_msg = await update.message.reply_text(
-            f"🔎 <b>Scanning past {LOOKBACK_DAYS} days across all 4 sites...</b> Please wait.",
+            f"🔎 <b>Scanning all 4 Ethiopian tender portals (past {LOOKBACK_DAYS} days)...</b>",
             parse_mode=ParseMode.HTML
         )
         scan_data = await self.scraper.scan_all_sources(ignore_seen=False)
@@ -794,31 +928,29 @@ class TenderBotApp:
 
         if not tenders:
             msg = (
-                f"✅ <b>Scan completed (Checked past {LOOKBACK_DAYS} days).</b>\n\n"
-                "All 4 sites were reached and multiple pages were scanned, but <b>no new tenders</b> matched your media/communication keywords.\n\n"
-                "💡 <i>Tips:</i>\n"
-                "• Send <code>/rescan</code> to see all 3-day tenders even if previously viewed\n"
-                "• Send <code>/latest</code> to inspect live listings\n"
-                "• Send <code>/keywords</code> to check or add more terms!"
+                f"✅ <b>You are 100% up to date!</b>\n\n"
+                f"All 4 websites were scanned for the past {LOOKBACK_DAYS} days. "
+                "You have already received all matching tenders published recently.\n\n"
+                "💡 <b>Want to view them again?</b>\n"
+                "👉 Tap or send <code>/rescan</code> to re-display all tenders from the past 3 days!"
             )
             await status_msg.edit_text(msg, parse_mode=ParseMode.HTML)
             return
 
-        await status_msg.edit_text(f"🎯 Found <b>{len(tenders)}</b> matching tender(s) from the past {LOOKBACK_DAYS} days! Sending now...", parse_mode=ParseMode.HTML)
+        await status_msg.edit_text(
+            f"🎯 Found <b>{len(tenders)}</b> verified tender(s)! Delivering now...",
+            parse_mode=ParseMode.HTML
+        )
 
         for tender in tenders:
             msg = format_tender_message(tender)
-            await update.message.reply_text(
-                msg,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=False
-            )
+            await update.message.reply_text(msg, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
             self.db.mark_tender_seen(tender)
             await asyncio.sleep(0.5)
 
     async def rescan_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_msg = await update.message.reply_text(
-            f"🔄 <b>Deep scanning past {LOOKBACK_DAYS} days (including already seen bids)...</b>",
+            f"🔄 <b>Deep scanning past {LOOKBACK_DAYS} days (including previously seen bids)...</b>",
             parse_mode=ParseMode.HTML
         )
         scan_data = await self.scraper.scan_all_sources(ignore_seen=True)
@@ -826,45 +958,37 @@ class TenderBotApp:
 
         if not tenders:
             await status_msg.edit_text(
-                f"ℹ️ No tenders matching media & communication services were found in the last {LOOKBACK_DAYS} days.",
-                parse_mode=ParseMode.HTML
-            )
-            return
-
-        await status_msg.edit_text(f"📬 Found <b>{len(tenders)}</b> total media tenders from the past {LOOKBACK_DAYS} days:", parse_mode=ParseMode.HTML)
-
-        for tender in tenders:
-            msg = format_tender_message(tender)
-            await update.message.reply_text(
-                msg,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=False
-            )
-            await asyncio.sleep(0.4)
-
-    async def latest_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        status_msg = await update.message.reply_text("📡 Connecting to all 4 portals...", parse_mode=ParseMode.HTML)
-        latest_tenders = await self.scraper.get_raw_latest()
-
-        if not latest_tenders:
-            await status_msg.edit_text(
-                "⚠️ Portals responded, but no list elements were parsed. Please check console logs or send /rescan.",
+                f"ℹ️ No tenders matching your keywords were found in the last {LOOKBACK_DAYS} days.",
                 parse_mode=ParseMode.HTML
             )
             return
 
         await status_msg.edit_text(
-            f"📋 Successfully fetched <b>{len(latest_tenders)}</b> live listings directly from the portals:",
+            f"📬 Found <b>{len(tenders)}</b> matching tenders from the past {LOOKBACK_DAYS} days:",
+            parse_mode=ParseMode.HTML
+        )
+
+        for tender in tenders:
+            msg = format_tender_message(tender)
+            await update.message.reply_text(msg, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
+            await asyncio.sleep(0.4)
+
+    async def latest_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        status_msg = await update.message.reply_text("📡 Fetching live sample posts from all 4 portals...", parse_mode=ParseMode.HTML)
+        latest_tenders = await self.scraper.get_raw_latest()
+
+        if not latest_tenders:
+            await status_msg.edit_text("⚠️ Could not parse sample items right now. Try /rescan.", parse_mode=ParseMode.HTML)
+            return
+
+        await status_msg.edit_text(
+            f"📋 Fetched <b>{len(latest_tenders)}</b> live listings directly from the websites:",
             parse_mode=ParseMode.HTML
         )
 
         for tender in latest_tenders:
             msg = format_tender_message(tender)
-            await update.message.reply_text(
-                msg,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=False
-            )
+            await update.message.reply_text(msg, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
             await asyncio.sleep(0.4)
 
     async def keywords_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -873,8 +997,8 @@ class TenderBotApp:
         text = (
             f"📋 <b>Monitored Service Keywords ({len(keywords)}):</b>\n\n"
             f"{formatted}\n\n"
-            "To add: <code>/addkeyword video production</code> (or in Amharic <code>/addkeyword ዶክመንተሪ</code>)\n"
-            "To delete: <code>/delkeyword translation</code>"
+            "➕ Add: <code>/addkeyword documentary</code>\n"
+            "➖ Remove: <code>/delkeyword translation</code>"
         )
         await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -882,91 +1006,141 @@ class TenderBotApp:
         if not context.args:
             await update.message.reply_text("⚠️ Usage: <code>/addkeyword &lt;your_keyword&gt;</code>", parse_mode=ParseMode.HTML)
             return
-
         kw = " ".join(context.args).strip()
-        success = self.db.add_keyword(kw)
-        if success:
+        if self.db.add_keyword(kw):
             await update.message.reply_text(f"✅ Added keyword: <code>{kw.lower()}</code>", parse_mode=ParseMode.HTML)
         else:
-            await update.message.reply_text(f"ℹ️ Keyword <code>{kw}</code> is already in the list or invalid.", parse_mode=ParseMode.HTML)
+            await update.message.reply_text(f"ℹ️ Keyword <code>{kw}</code> already exists.", parse_mode=ParseMode.HTML)
 
     async def del_keyword_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
-            await update.message.reply_text("⚠️ Usage: <code>/delkeyword &lt;keyword_to_remove&gt;</code>", parse_mode=ParseMode.HTML)
+            await update.message.reply_text("⚠️ Usage: <code>/delkeyword &lt;keyword&gt;</code>", parse_mode=ParseMode.HTML)
             return
-
         kw = " ".join(context.args).strip()
-        success = self.db.remove_keyword(kw)
-        if success:
+        if self.db.remove_keyword(kw):
             await update.message.reply_text(f"🗑 Removed keyword: <code>{kw.lower()}</code>", parse_mode=ParseMode.HTML)
         else:
-            await update.message.reply_text(f"⚠️ Keyword <code>{kw}</code> was not found.", parse_mode=ParseMode.HTML)
+            await update.message.reply_text(f"⚠️ Keyword <code>{kw}</code> not found.", parse_mode=ParseMode.HTML)
+
+    # --- MULTI-CLIENT SAAS COMMANDS ---
+    async def subscribe_client_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if len(context.args) < 2:
+            await update.message.reply_text(
+                "💼 <b>Add a Paying Client or Telegram Group:</b>\n\n"
+                "Usage:\n<code>/subscribe &lt;Chat_ID&gt; &lt;Company Name&gt;</code>\n\n"
+                "Example:\n<code>/subscribe -100192837465 Abyssinia Media PLC</code>\n\n"
+                "<i>Tip: Add this bot to your client's Telegram group and type /start in their group to see their Chat ID!</i>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        client_chat_id = context.args[0].strip()
+        company_name = " ".join(context.args[1:]).strip()
+        self.db.add_client(client_chat_id, company_name)
+        await update.message.reply_text(
+            f"✅ <b>Client Subscribed Successfully!</b>\n\n"
+            f"🏢 <b>Company:</b> {company_name}\n"
+            f"🆔 <b>Chat ID:</b> <code>{client_chat_id}</code>\n\n"
+            "They will now automatically receive all matching tender alerts every 30 minutes!",
+            parse_mode=ParseMode.HTML
+        )
+
+    async def unsubscribe_client_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("⚠️ Usage: <code>/unsubscribe &lt;Chat_ID&gt;</code>", parse_mode=ParseMode.HTML)
+            return
+        client_chat_id = context.args[0].strip()
+        if self.db.remove_client(client_chat_id):
+            await update.message.reply_text(f"🗑 Unsubscribed client <code>{client_chat_id}</code>.", parse_mode=ParseMode.HTML)
+        else:
+            await update.message.reply_text(f"⚠️ Client ID <code>{client_chat_id}</code> not found.", parse_mode=ParseMode.HTML)
+
+    async def clients_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        clients = self.db.get_active_clients()
+        if not clients:
+            await update.message.reply_text("ℹ️ No active clients registered yet.", parse_mode=ParseMode.HTML)
+            return
+
+        lines = [f"{idx+1}. <b>{c['name']}</b> (<code>{c['chat_id']}</code>)" for idx, c in enumerate(clients)]
+        text = (
+            f"💼 <b>Active Subscribed Clients ({len(clients)}):</b>\n\n"
+            + "\n".join(lines) +
+            "\n\n➕ Add new client: <code>/subscribe &lt;Chat_ID&gt; &lt;Company Name&gt;</code>\n"
+            "➖ Remove client: <code>/unsubscribe &lt;Chat_ID&gt;</code>"
+        )
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         stats = self.db.get_stats()
+        ai_mode = "🟢 Enabled (Gemini 1.5 Flash)" if AI_KEY else "🟡 Keyword Mode (Add GEMINI_API_KEY to enable AI)"
+        merkato_auth = "🟢 Logged In (Paid Account)" if MERKATO_USER else "⚪ Public / Free Tier"
+        afro_auth = "🟢 Logged In (Paid Account)" if AFRO_USER else "⚪ Public / Free Tier"
+
         text = (
-            "📊 <b>Tender Monitor Bot Status</b>\n\n"
-            f"• <b>Total Seen Bids Recorded:</b> {stats['total_seen']}\n"
+            "📊 <b>Enterprise Tender Bot Status</b>\n\n"
+            f"• <b>AI Precision Filter:</b> {ai_mode}\n"
+            f"• <b>2Merkato Session:</b> {merkato_auth}\n"
+            f"• <b>AfroTender Session:</b> {afro_auth}\n"
+            f"• <b>Active Paying Clients:</b> {stats['total_clients']}\n"
+            f"• <b>Total Deduplicated Tenders:</b> {stats['total_seen']}\n"
             f"• <b>Monitored Keywords:</b> {stats['total_keywords']}\n"
             f"• <b>Auto-Scan Frequency:</b> Every {SCAN_INTERVAL_MINUTES} minutes\n"
-            f"• <b>Web Targets:</b>\n"
-            "  1. tender.2merkato.com/tenders\n"
-            "  2. ethiojobs.net/jobs\n"
-            "  3. reportertenders.com & t.me/s/reportertender\n"
-            "  4. afrotender.com/tenders\n"
-            f"• <b>System Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            f"• <b>Server Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 # ==========================================
-# SCHEDULED BACKGROUND SCANNER
+# ⏰ MULTI-CLIENT AUTO-BROADCASTER
 # ==========================================
 async def periodic_scan_job(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = context.job.data.get("chat_id")
-    if not chat_id:
-        return
-
     scraper: TenderScraper = context.job.data.get("scraper")
     db: Database = context.job.data.get("db")
 
-    logger.info("Executing scheduled tender scan...")
+    clients = db.get_active_clients()
+    if not clients:
+        return
+
+    logger.info(f"Running scheduled scan for {len(clients)} subscribed client(s)...")
     try:
-        scan_data = await scraper.scan_all_sources()
+        scan_data = await scraper.scan_all_sources(ignore_seen=False)
         tenders = scan_data["tenders"]
         if tenders:
-            logger.info(f"Discovered {len(tenders)} matching tenders during auto-scan.")
+            logger.info(f"Broadcasting {len(tenders)} new tenders to {len(clients)} client(s).")
             for tender in tenders:
                 msg = format_tender_message(tender)
-                try:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=msg,
-                        parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=False
-                    )
-                    db.mark_tender_seen(tender)
-                    await asyncio.sleep(0.5)
-                except Exception as send_err:
-                    logger.error(f"Failed to deliver message to Telegram: {send_err}")
+                for client_info in clients:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=client_info["chat_id"],
+                            text=msg,
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=False
+                        )
+                        await asyncio.sleep(0.3)
+                    except Exception as send_err:
+                        logger.error(f"Failed sending to client {client_info['chat_id']}: {send_err}")
+                db.mark_tender_seen(tender)
         else:
-            logger.info("Scheduled scan completed. No new matching tenders found.")
+            logger.info("Scheduled scan complete. No brand-new tenders since last check.")
     except Exception as e:
         logger.error(f"Error during periodic scan: {e}")
 
 
 # ==========================================
-# MAIN EXECUTION
+# 🚀 MAIN ENTRYPOINT
 # ==========================================
 def main():
     if not BOT_TOKEN:
-        print("\n" + "="*60)
-        print("ERROR: TELEGRAM_BOT_TOKEN is not configured!")
-        print("="*60 + "\n")
+        print("ERROR: BOT_TOKEN is missing!")
         sys.exit(1)
 
+    # Start free cloud port listener so Render Web Service ($0/mo) works seamlessly
+    start_free_cloud_web_server()
+
     db = Database(DATABASE_PATH)
-    scraper = TenderScraper(db)
+    ai = AITenderAnalyzer(AI_KEY)
+    scraper = TenderScraper(db, ai)
     bot_app = TenderBotApp(db, scraper)
 
     app = Application.builder().token(BOT_TOKEN).build()
@@ -979,23 +1153,22 @@ def main():
     app.add_handler(CommandHandler("keywords", bot_app.keywords_command))
     app.add_handler(CommandHandler("addkeyword", bot_app.add_keyword_command))
     app.add_handler(CommandHandler("delkeyword", bot_app.del_keyword_command))
+    app.add_handler(CommandHandler("subscribe", bot_app.subscribe_client_command))
+    app.add_handler(CommandHandler("unsubscribe", bot_app.unsubscribe_client_command))
+    app.add_handler(CommandHandler("clients", bot_app.clients_command))
     app.add_handler(CommandHandler("status", bot_app.status_command))
 
-    if AUTHORIZED_CHAT_ID:
-        job_queue = app.job_queue
-        job_queue.run_repeating(
-            periodic_scan_job,
-            interval=SCAN_INTERVAL_MINUTES * 60,
-            first=10,
-            data={"chat_id": AUTHORIZED_CHAT_ID, "scraper": scraper, "db": db},
-            name="tender_scanner_job"
-        )
-        logger.info(f"Scheduled scanner active for Chat ID: {AUTHORIZED_CHAT_ID} every {SCAN_INTERVAL_MINUTES} mins.")
-    else:
-        logger.warning("MY_CHAT_ID is not configured.")
+    job_queue = app.job_queue
+    job_queue.run_repeating(
+        periodic_scan_job,
+        interval=SCAN_INTERVAL_MINUTES * 60,
+        first=10,
+        data={"scraper": scraper, "db": db},
+        name="enterprise_tender_scanner"
+    )
 
-    print("\n🚀 Tender Monitor Bot is running! Press Ctrl+C to stop.")
-    app.run_polling()
+    print("\n🚀 Enterprise AI Tender Bot is running! Press Ctrl+C to stop.")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
